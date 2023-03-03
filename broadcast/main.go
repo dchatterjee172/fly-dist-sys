@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -43,7 +44,7 @@ func (ts *topologyStore) Get(node string) []string {
 
 type messageStore struct {
 	messages map[int]bool
-	mutex    sync.Mutex
+	mutex    sync.RWMutex
 }
 
 func NewMessageStore() *messageStore {
@@ -66,8 +67,8 @@ func (v *messageStore) Add(value int) bool {
 }
 
 func (v *messageStore) GetAll() []int {
-	v.mutex.Lock()
-	defer v.mutex.Unlock()
+	v.mutex.RLock()
+	defer v.mutex.RUnlock()
 
 	messages := make([]int, len(v.messages))
 
@@ -79,36 +80,49 @@ func (v *messageStore) GetAll() []int {
 	return messages
 }
 
+func broadcast(messages *messageStore, topologyStore *topologyStore, n *maelstrom.Node) {
+	connectedNodes := topologyStore.Get(n.ID())
+
+	if connectedNodes == nil {
+		return
+	}
+
+	for _, message := range messages.GetAll() {
+		for _, destinationNode := range connectedNodes {
+			n.RPC(
+				destinationNode,
+				map[string]any{"type": "broadcast", "message": message},
+				func(msg maelstrom.Message) error { return nil },
+			)
+		}
+	}
+}
+
 func main() {
 	var topologyStore topologyStore
-    messages := NewMessageStore()
-
+	messages := NewMessageStore()
+	done := make(chan bool)
+	ticker := time.NewTicker(200 * time.Millisecond)
 	n := maelstrom.NewNode()
+
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				broadcast(messages, &topologyStore, n)
+			}
+		}
+	}()
+
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body broadcastRequest
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
 
-		isNewMessage := messages.Add(body.Message)
-		if !isNewMessage {
-			return n.Reply(msg, map[string]string{"type": "broadcast_ok"})
-		}
-
-		connectedNodes := topologyStore.Get(n.ID())
-
-		if connectedNodes == nil {
-			return n.Reply(msg, map[string]string{"type": "broadcast_ok"})
-		}
-
-		for _, destinationNode := range connectedNodes {
-			n.RPC(
-				destinationNode,
-				map[string]any{"type": "broadcast", "message": body.Message},
-				func(msg maelstrom.Message) error { return nil },
-			)
-		}
-
+		messages.Add(body.Message)
 		return n.Reply(msg, map[string]string{"type": "broadcast_ok"})
 	})
 
@@ -130,7 +144,11 @@ func main() {
 		return n.Reply(msg, map[string]string{"type": "topology_ok"})
 	})
 
-	if err := n.Run(); err != nil {
+	err := n.Run()
+	ticker.Stop()
+	done <- true
+
+	if err != nil {
 		log.Fatal(err)
 	}
 }
