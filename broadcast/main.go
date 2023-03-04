@@ -1,8 +1,12 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,7 +25,14 @@ type topologyStore struct {
 }
 
 type broadcastRequest struct {
-	Message int `json:"message"`
+	Message       int    `json:"message"`
+	ReadRecipient string `json:"read_recipient"`
+}
+
+type messageToBeSent struct {
+	Message           int
+	DestinationNodeId string
+	ReadRecipient     string
 }
 
 func (ts *topologyStore) Set(topology topology) {
@@ -39,7 +50,7 @@ func (ts *topologyStore) Get(node string) []string {
 	if present {
 		return value
 	}
-	return nil
+	return make([]string, 0)
 }
 
 type messageStore struct {
@@ -80,20 +91,34 @@ func (v *messageStore) GetAll() []int {
 	return messages
 }
 
-func broadcast(messages *messageStore, topologyStore *topologyStore, n *maelstrom.Node) {
-	connectedNodes := topologyStore.Get(n.ID())
+func broadcast(ctx context.Context,
+	wg *sync.WaitGroup,
+	broadcastChannel chan *messageToBeSent,
+	n *maelstrom.Node) {
+	defer wg.Done()
 
-	if connectedNodes == nil {
-		return
-	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case messageToBeSent := <-broadcastChannel:
+			ctxT, cancel := context.WithTimeout(ctx, 1000*time.Millisecond)
+			defer cancel()
 
-	for _, message := range messages.GetAll() {
-		for _, destinationNode := range connectedNodes {
-			n.RPC(
-				destinationNode,
-				map[string]any{"type": "broadcast", "message": message},
-				func(msg maelstrom.Message) error { return nil },
+			_, err := n.SyncRPC(
+				ctxT,
+				messageToBeSent.DestinationNodeId,
+				map[string]any{
+					"type":           "broadcast",
+					"message":        messageToBeSent.Message,
+					"read_recipient": messageToBeSent.ReadRecipient},
 			)
+
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					broadcastChannel <- messageToBeSent
+				}
+			}
 		}
 	}
 }
@@ -101,20 +126,16 @@ func broadcast(messages *messageStore, topologyStore *topologyStore, n *maelstro
 func main() {
 	var topologyStore topologyStore
 	messages := NewMessageStore()
-	done := make(chan bool)
-	ticker := time.NewTicker(200 * time.Millisecond)
+	broadcastChannel := make(chan *messageToBeSent, 200000)
 	n := maelstrom.NewNode()
+	numGoRoutines := 50
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
 
-	go func() {
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				broadcast(messages, &topologyStore, n)
-			}
-		}
-	}()
+	for i := 0; i < numGoRoutines; i++ {
+		wg.Add(1)
+		go broadcast(ctx, &wg, broadcastChannel, n)
+	}
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body broadcastRequest
@@ -122,7 +143,29 @@ func main() {
 			return err
 		}
 
-		messages.Add(body.Message)
+		isNew := messages.Add(body.Message)
+
+		if isNew {
+			neighbours := topologyStore.Get(n.ID())
+
+			for _, destinationNodeId := range neighbours {
+				signature := fmt.Sprintf(",%s,", destinationNodeId)
+
+				if !strings.Contains(body.ReadRecipient, signature) {
+					var sb strings.Builder
+					sb.WriteString(body.ReadRecipient)
+					sb.WriteString(fmt.Sprintf(",%s,", signature))
+
+					newReadRecipient := sb.String()
+					broadcastChannel <- &messageToBeSent{
+						DestinationNodeId: destinationNodeId,
+						Message:           body.Message,
+						ReadRecipient:     newReadRecipient,
+					}
+				}
+			}
+		}
+
 		return n.Reply(msg, map[string]string{"type": "broadcast_ok"})
 	})
 
@@ -145,8 +188,8 @@ func main() {
 	})
 
 	err := n.Run()
-	ticker.Stop()
-	done <- true
+	cancel()
+	wg.Wait()
 
 	if err != nil {
 		log.Fatal(err)
