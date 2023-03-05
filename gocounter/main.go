@@ -6,7 +6,6 @@ import (
 	"errors"
 	"log"
 	"sync"
-	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -55,14 +54,15 @@ func (vs *valueStore) Get() int {
 	return vs.value
 }
 
-func (vs *valueStore) SetIfGreater(value int) int {
+func (vs *valueStore) SetIfGreater(value int) (int, bool) {
 	vs.mutex.Lock()
 	defer vs.mutex.Unlock()
 
 	if value > vs.value {
-        vs.value = value
+		vs.value = value
+		return vs.value, true
 	}
-	return vs.value
+	return vs.value, false
 }
 
 func readFromKVWithDefaultZero(ctx context.Context, kv *maelstrom.KV, key string) (int, error) {
@@ -93,7 +93,8 @@ func compareAnvsetInKV(ctx context.Context, kv *maelstrom.KV, key string, from i
 	return true, nil
 }
 
-func syncDeltaToKV(ctx context.Context, kv *maelstrom.KV, deltaStore *valueStore, key string, valueStore *valueStore) error {
+func syncDeltaToKV(ctx context.Context, kv *maelstrom.KV, deltaStore *valueStore, key string,
+	valueStore *valueStore, broadcastSignal chan bool, syncDeltaSignal chan bool) error {
 	currentDelta := deltaStore.Get()
 
 	if currentDelta < 1 {
@@ -115,7 +116,10 @@ func syncDeltaToKV(ctx context.Context, kv *maelstrom.KV, deltaStore *valueStore
 
 	if wasSet {
 		deltaStore.Sub(currentDelta)
-        valueStore.SetIfGreater(nextValue)
+		valueStore.SetIfGreater(nextValue)
+		sendSignal(broadcastSignal)
+	} else {
+		sendSignal(syncDeltaSignal)
 	}
 
 	return nil
@@ -123,9 +127,9 @@ func syncDeltaToKV(ctx context.Context, kv *maelstrom.KV, deltaStore *valueStore
 
 func broadcast(n *maelstrom.Node, vs *valueStore) {
 	for _, destinationNode := range n.NodeIDs() {
-        if n.ID() == destinationNode {
-            continue
-        }
+		if n.ID() == destinationNode {
+			continue
+		}
 		n.Send(
 			destinationNode,
 			map[string]any{"type": "broadcast", "value": vs.Get()},
@@ -133,24 +137,49 @@ func broadcast(n *maelstrom.Node, vs *valueStore) {
 	}
 }
 
+func sendSignal(channel chan bool) {
+	select {
+	case channel <- true:
+	default:
+	}
+}
+
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewSeqKV(n)
 	deltaStore := newValueStore()
-    valueStore := newValueStore()
+	valueStore := newValueStore()
 	ctx := context.TODO()
 	key := "val"
-	done := make(chan bool)
-	ticker := time.NewTicker(200 * time.Millisecond)
 
+	syncDeltaSignal := make(chan bool, 1)
+	broadcastSignal := make(chan bool, 1)
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
-			case <-done:
+			case <-ctx.Done():
 				return
-			case <-ticker.C:
-				syncDeltaToKV(ctx, kv, deltaStore, key, valueStore)
-                broadcast(n, valueStore)
+			case <-syncDeltaSignal:
+				syncDeltaToKV(ctx, kv, deltaStore, key, valueStore, broadcastSignal, syncDeltaSignal)
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-broadcastSignal:
+				broadcast(n, valueStore)
 			}
 		}
 	}()
@@ -164,6 +193,8 @@ func main() {
 		delta := body.Delta
 		deltaStore.Add(delta)
 
+		sendSignal(syncDeltaSignal)
+
 		return n.Reply(msg, map[string]string{"type": "add_ok"})
 	})
 
@@ -174,9 +205,13 @@ func main() {
 		}
 
 		value := body.Value
-        valueStore.SetIfGreater(value)
+		_, isSet := valueStore.SetIfGreater(value)
 
-        return nil
+		if isSet {
+			sendSignal(broadcastSignal)
+		}
+
+		return nil
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
@@ -185,9 +220,12 @@ func main() {
 			return err
 		}
 		currentDelta := deltaStore.Get()
-        value := currentDelta + currentValue
+		value := currentDelta + currentValue
 
-        value = valueStore.SetIfGreater(value)
+		value, isSet := valueStore.SetIfGreater(value)
+		if isSet {
+			sendSignal(broadcastSignal)
+		}
 		return n.Reply(
 			msg,
 			map[string]any{"type": "read_ok", "value": value},
@@ -195,8 +233,8 @@ func main() {
 	})
 
 	err := n.Run()
-	ticker.Stop()
-	done <- true
+	cancel()
+	wg.Wait()
 
 	if err != nil {
 		log.Fatal(err)
