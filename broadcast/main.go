@@ -4,9 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,8 +23,7 @@ type topologyStore struct {
 }
 
 type broadcastRequest struct {
-	Message       int    `json:"message"`
-	ReadRecipient string `json:"read_recipient"`
+	Message int `json:"message"`
 }
 
 type messageToBeSent struct {
@@ -109,9 +106,9 @@ func broadcast(ctx context.Context,
 				ctxT,
 				messageToBeSent.DestinationNodeId,
 				map[string]any{
-					"type":           "broadcast",
-					"message":        messageToBeSent.Message,
-					"read_recipient": messageToBeSent.ReadRecipient},
+					"type":    "broadcast",
+					"message": messageToBeSent.Message,
+				},
 			)
 
 			if err != nil {
@@ -149,19 +146,9 @@ func main() {
 			neighbours := topologyStore.Get(n.ID())
 
 			for _, destinationNodeId := range neighbours {
-				signature := fmt.Sprintf(",%s,", destinationNodeId)
-
-				if !strings.Contains(body.ReadRecipient, signature) {
-					var sb strings.Builder
-					sb.WriteString(body.ReadRecipient)
-					sb.WriteString(fmt.Sprintf(",%s,", signature))
-
-					newReadRecipient := sb.String()
-					broadcastChannel <- &messageToBeSent{
-						DestinationNodeId: destinationNodeId,
-						Message:           body.Message,
-						ReadRecipient:     newReadRecipient,
-					}
+				broadcastChannel <- &messageToBeSent{
+					DestinationNodeId: destinationNodeId,
+					Message:           body.Message,
 				}
 			}
 		}
