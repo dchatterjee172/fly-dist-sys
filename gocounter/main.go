@@ -149,7 +149,6 @@ func main() {
 	kv := maelstrom.NewSeqKV(n)
 	deltaStore := newValueStore()
 	valueStore := newValueStore()
-	ctx := context.TODO()
 	key := "val"
 
 	syncDeltaSignal := make(chan bool, 1)
