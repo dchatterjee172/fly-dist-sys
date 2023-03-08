@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
@@ -27,9 +28,22 @@ type listCommitedOffsetsRequest struct {
 	Keys []string `json:"keys"`
 }
 
+type broadcastRequest struct {
+	Key     string `json:"key"`
+	Offset  int    `json:"offset"`
+	Message int    `json:"msg"`
+}
+
 type storage struct {
 	offsets  []int
 	messages []int
+}
+
+type messageToBeSent struct {
+	DestinationNodeId string
+	Key               string
+	Message           int
+	Offset            int
 }
 
 func NewStorage() *storage {
@@ -154,11 +168,53 @@ func getOffSet(ctx context.Context, kv *maelstrom.KV, retries int) (int, error) 
 	return 0, errors.New("Could not generate offset")
 }
 
+func broadcast(ctx context.Context,
+	wg *sync.WaitGroup,
+	broadcastChannel chan *messageToBeSent,
+	n *maelstrom.Node) {
+	defer wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case messageToBeSent := <-broadcastChannel:
+			ctxT, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+			defer cancel()
+
+			_, err := n.SyncRPC(
+				ctxT,
+				messageToBeSent.DestinationNodeId,
+				map[string]any{
+					"type":   "broadcast",
+					"msg":    messageToBeSent.Message,
+					"offset": messageToBeSent.Offset,
+					"key":    messageToBeSent.Key,
+				},
+			)
+
+			if err != nil {
+				if !errors.Is(err, context.Canceled) {
+					broadcastChannel <- messageToBeSent
+				}
+			}
+		}
+	}
+}
+
 func main() {
 	n := maelstrom.NewNode()
 	kv := maelstrom.NewLinKV(n)
 	ctx, cancel := context.WithCancel(context.Background())
 	keyStorage := NewKeyStorage()
+	broadcastChannel := make(chan *messageToBeSent, 200000)
+	numGoRoutines := 5
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoRoutines; i++ {
+		wg.Add(1)
+		go broadcast(ctx, &wg, broadcastChannel, n)
+	}
 
 	n.Handle("send", func(msg maelstrom.Message) error {
 		var body sendRequest
@@ -173,7 +229,30 @@ func main() {
 
 		keyStorage.Set(body.Key, offset, body.Message)
 
+		for _, nodeId := range n.NodeIDs() {
+			if nodeId == n.ID() {
+				continue
+			}
+			broadcastChannel <- &messageToBeSent{
+				DestinationNodeId: nodeId,
+				Key:               body.Key,
+				Offset:            offset,
+				Message:           body.Message,
+			}
+		}
+
 		return n.Reply(msg, map[string]any{"type": "send_ok", "offset": offset})
+	})
+
+	n.Handle("broadcast", func(msg maelstrom.Message) error {
+		var body broadcastRequest
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
+		keyStorage.Set(body.Key, body.Offset, body.Message)
+
+		return n.Reply(msg, map[string]any{"type": "broadcast_ok"})
 	})
 
 	n.Handle("poll", func(msg maelstrom.Message) error {
@@ -228,6 +307,7 @@ func main() {
 
 	err := n.Run()
 	cancel()
+	wg.Wait()
 	if err != nil {
 		log.Fatal(err)
 	}
