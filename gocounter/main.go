@@ -130,7 +130,7 @@ func broadcast(n *maelstrom.Node, vs *valueStore) {
 		if n.ID() == destinationNode {
 			continue
 		}
-		n.Send(
+		_ = n.Send(
 			destinationNode,
 			map[string]any{"type": "broadcast", "value": vs.Get()},
 		)
@@ -165,7 +165,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-syncDeltaSignal:
-				syncDeltaToKV(ctx, kv, deltaStore, key, valueStore, broadcastSignal, syncDeltaSignal)
+				_ = syncDeltaToKV(ctx, kv, deltaStore, key, valueStore, broadcastSignal, syncDeltaSignal)
 			}
 		}
 	}()

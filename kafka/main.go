@@ -276,8 +276,14 @@ func main() {
 			return err
 		}
 
+		var err error
+
 		for key, offset := range body.Offsets {
-			kv.Write(ctx, key, offset)
+			err = kv.Write(ctx, key, offset)
+		}
+
+		if err != nil {
+			return err
 		}
 
 		return n.Reply(msg, map[string]any{"type": "commit_offsets_ok"})
